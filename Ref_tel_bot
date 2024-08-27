@@ -1,0 +1,421 @@
+import telebot
+import sqlite3
+from datetime import datetime, timedelta
+from functools import wraps
+import time
+import schedule
+import threading
+import random
+import string
+import qrcode
+from io import BytesIO
+import csv
+import io
+from telegram_stars_api import TelegramStarsAPI
+from config import (BOT_TOKEN, ADMIN_IDS, CHANNEL_ID, STARS_API_TOKEN, 
+                    DATABASE_NAME, MIN_REWARD_THRESHOLD, CRYPTO_API_KEY)
+from translations import TRANSLATIONS
+import requests
+from binance.client import Client
+from crm_integration import CRMIntegration
+from analytics import AnalyticsEngine
+
+bot = telebot.TeleBot(BOT_TOKEN)
+stars_api = TelegramStarsAPI(STARS_API_TOKEN)
+binance_client = Client("", "")  # Add your Binance API keys if needed
+crm = CRMIntegration()
+analytics = AnalyticsEngine()
+
+conn = sqlite3.connect(DATABASE_NAME, check_same_thread=False)
+cursor = conn.cursor()
+
+# Initialize database
+cursor.execute('''CREATE TABLE IF NOT EXISTS users
+                  (user_id INTEGER PRIMARY KEY, username TEXT, referrer_id INTEGER, 
+                   subscription_end DATETIME, language TEXT DEFAULT 'en', level INTEGER DEFAULT 1)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS referrals
+                  (referrer_id INTEGER, referred_id INTEGER, level INTEGER, 
+                   PRIMARY KEY (referrer_id, referred_id))''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS settings
+                  (key TEXT PRIMARY KEY, value TEXT)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS guest_invites
+                  (invite_code TEXT PRIMARY KEY, created_by INTEGER, expires_at DATETIME)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS rewards
+                  (user_id INTEGER, amount FLOAT, date DATETIME)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS channels
+                  (channel_id INTEGER PRIMARY KEY, name TEXT, subscription_price FLOAT)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS promo_codes
+                  (code TEXT PRIMARY KEY, discount FLOAT, expires_at DATETIME)''')
+conn.commit()
+
+def init_settings():
+    default_settings = {
+        'subscription_price': '10',
+        'referral_percent_level1': '15',
+        'referral_percent_level2': '5',
+        'usdt_price': '10',
+        'min_withdrawal': '5',
+        'support_chat_id': '-1001234567890'
+    }
+    for key, value in default_settings.items():
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+init_settings()
+
+def admin_required(func):
+    @wraps(func)
+    def wrapped(message, *args, **kwargs):
+        if message.from_user.id not in ADMIN_IDS:
+            bot.reply_to(message, translate('admin_required', message.from_user.id))
+            return
+        return func(message, *args, **kwargs)
+    return wrapped
+
+def active_subscription_required(func):
+    @wraps(func)
+    def wrapped(message, *args, **kwargs):
+        user_id = message.from_user.id
+        cursor.execute('SELECT subscription_end FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        if not result or result[0] is None or datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S') < datetime.now():
+            bot.reply_to(message, translate('subscription_required', user_id))
+            return
+        return func(message, *args, **kwargs)
+    return wrapped
+
+def translate(key, user_id):
+    cursor.execute('SELECT language FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    lang = result[0] if result else 'en'
+    return TRANSLATIONS[lang].get(key, TRANSLATIONS['en'].get(key, key))
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    referrer_id = message.text.split()[1] if len(message.text.split()) > 1 else None
+    
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    if cursor.fetchone() is None:
+        cursor.execute('INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)',
+                       (user_id, username, referrer_id))
+        if referrer_id:
+            cursor.execute('INSERT INTO referrals (referrer_id, referred_id, level) VALUES (?, ?, ?)',
+                           (referrer_id, user_id, 1))
+            second_level_referrer = cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (referrer_id,)).fetchone()
+            if second_level_referrer:
+                cursor.execute('INSERT INTO referrals (referrer_id, referred_id, level) VALUES (?, ?, ?)',
+                               (second_level_referrer[0], user_id, 2))
+        conn.commit()
+        crm.add_user(user_id, username)
+    
+    bot.reply_to(message, translate('welcome_message', user_id))
+
+@bot.message_handler(commands=['subscribe'])
+def subscribe(message):
+    user_id = message.from_user.id
+    cursor.execute('SELECT value FROM settings WHERE key = ?', ('subscription_price',))
+    price = float(cursor.fetchone()[0])
+    
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.row(telebot.types.InlineKeyboardButton(translate('pay_with_stars', user_id), callback_data='pay_stars'),
+                 telebot.types.InlineKeyboardButton(translate('pay_with_usdt', user_id), callback_data='pay_usdt'))
+    
+    bot.reply_to(message, translate('subscription_info', user_id).format(price), reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: call.data in ['pay_stars', 'pay_usdt'])
+def process_payment(call):
+    user_id = call.from_user.id
+    if call.data == 'pay_stars':
+        cursor.execute('SELECT value FROM settings WHERE key = ?', ('subscription_price',))
+        price = float(cursor.fetchone()[0])
+        payment_url = stars_api.create_payment(user_id, price)
+        bot.send_message(user_id, translate('payment_link', user_id), reply_markup=telebot.types.InlineKeyboardMarkup().add(telebot.types.InlineKeyboardButton(text=translate('pay', user_id), url=payment_url)))
+    elif call.data == 'pay_usdt':
+        cursor.execute('SELECT value FROM settings WHERE key = ?', ('usdt_price',))
+        price = float(cursor.fetchone()[0])
+        wallet_address = generate_unique_wallet_address()
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(f"tether:{wallet_address}?amount={price}")
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        bio = BytesIO()
+        img.save(bio, 'PNG')
+        bio.seek(0)
+        bot.send_photo(user_id, bio, caption=translate('usdt_payment_info', user_id).format(price, wallet_address))
+        start_payment_check(user_id, wallet_address, price)
+
+def generate_unique_wallet_address():
+    # This is a placeholder. In a real scenario, you'd integrate with a crypto payment processor
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=34))
+
+def start_payment_check(user_id, wallet_address, expected_amount):
+    def check_payment():
+        # This is a placeholder. In a real scenario, you'd check with your crypto payment processor
+        # For demonstration, we'll assume the payment is received after 60 seconds
+        time.sleep(60)
+        process_successful_payment(user_id, expected_amount)
+
+    thread = threading.Thread(target=check_payment)
+    thread.start()
+
+def process_successful_payment(user_id, amount):
+    extend_subscription(user_id, 30)  # Extend for 30 days
+    process_referral_reward(user_id, amount)
+    bot.send_message(user_id, translate('payment_successful', user_id))
+
+def extend_subscription(user_id, days):
+    cursor.execute('SELECT subscription_end FROM users WHERE user_id = ?', (user_id,))
+    current_end = cursor.fetchone()[0]
+    if current_end and datetime.strptime(current_end, '%Y-%m-%d %H:%M:%S') > datetime.now():
+        new_end = datetime.strptime(current_end, '%Y-%m-%d %H:%M:%S') + timedelta(days=days)
+    else:
+        new_end = datetime.now() + timedelta(days=days)
+    cursor.execute('UPDATE users SET subscription_end = ? WHERE user_id = ?', (new_end.strftime('%Y-%m-%d %H:%M:%S'), user_id))
+    conn.commit()
+    crm.update_user_subscription(user_id, new_end)
+
+def process_referral_reward(referred_user_id, payment_amount):
+    cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (referred_user_id,))
+    referrer_id = cursor.fetchone()
+    if referrer_id:
+        referrer_id = referrer_id[0]
+        cursor.execute('SELECT value FROM settings WHERE key = ?', ('referral_percent_level1',))
+        reward_percent = float(cursor.fetchone()[0]) / 100
+        reward_amount = payment_amount * reward_percent
+        cursor.execute('INSERT INTO rewards (user_id, amount, date) VALUES (?, ?, ?)', 
+                       (referrer_id, reward_amount, datetime.now()))
+        conn.commit()
+        bot.send_message(referrer_id, translate('referral_reward', referrer_id).format(reward_amount))
+        
+        # Process second level referral
+        cursor.execute('SELECT referrer_id FROM users WHERE user_id = ?', (referrer_id,))
+        second_level_referrer = cursor.fetchone()
+        if second_level_referrer:
+            second_level_referrer_id = second_level_referrer[0]
+            cursor.execute('SELECT value FROM settings WHERE key = ?', ('referral_percent_level2',))
+            reward_percent_level2 = float(cursor.fetchone()[0]) / 100
+            reward_amount_level2 = payment_amount * reward_percent_level2
+            cursor.execute('INSERT INTO rewards (user_id, amount, date) VALUES (?, ?, ?)', 
+                           (second_level_referrer_id, reward_amount_level2, datetime.now()))
+            conn.commit()
+            bot.send_message(second_level_referrer_id, translate('referral_reward_level2', second_level_referrer_id).format(reward_amount_level2))
+
+@bot.message_handler(commands=['referral'])
+@active_subscription_required
+def referral(message):
+    user_id = message.from_user.id
+    bot_info = bot.get_me()
+    invite_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    bot.reply_to(message, translate('referral_info', user_id).format(invite_link))
+
+@bot.message_handler(commands=['stats'])
+@active_subscription_required
+def stats(message):
+    user_id = message.from_user.id
+    cursor.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND level = 1', (user_id,))
+    direct_referrals = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND level = 2', (user_id,))
+    indirect_referrals = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT SUM(amount) FROM rewards WHERE user_id = ?', (user_id,))
+    total_reward = cursor.fetchone()[0] or 0
+    
+    bot.reply_to(message, translate('stats_info', user_id).format(direct_referrals, indirect_referrals, total_reward))
+
+@bot.message_handler(commands=['withdraw'])
+@active_subscription_required
+def withdraw(message):
+    user_id = message.from_user.id
+    cursor.execute('SELECT SUM(amount) FROM rewards WHERE user_id = ?', (user_id,))
+    total_reward = cursor.fetchone()[0] or 0
+    
+    cursor.execute('SELECT value FROM settings WHERE key = ?', ('min_withdrawal',))
+    min_withdrawal = float(cursor.fetchone()[0])
+    
+    if total_reward < min_withdrawal:
+        bot.reply_to(message, translate('min_reward_not_reached', user_id).format(min_withdrawal))
+    else:
+        # Here should be the logic for processing the withdrawal
+        bot.reply_to(message, translate('withdrawal_processed', user_id).format(total_reward))
+        cursor.execute('DELETE FROM rewards WHERE user_id = ?', (user_id,))
+        conn.commit()
+
+@bot.message_handler(commands=['admin'])
+@admin_required
+def admin_panel(message):
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.row(telebot.types.InlineKeyboardButton(translate('set_price', message.from_user.id), callback_data='set_price'),
+                 telebot.types.InlineKeyboardButton(translate('set_referral_percent', message.from_user.id), callback_data='set_referral_percent'))
+    keyboard.row(telebot.types.InlineKeyboardButton(translate('export_users', message.from_user.id), callback_data='export_users'),
+                 telebot.types.InlineKeyboardButton(translate('create_guest_invite', message.from_user.id), callback_data='create_guest_invite'))
+    keyboard.row(telebot.types.InlineKeyboardButton(translate('set_usdt_price', message.from_user.id), callback_data='set_usdt_price'),
+                 telebot.types.InlineKeyboardButton(translate('create_promo', message.from_user.id), callback_data='create_promo'))
+    keyboard.row(telebot.types.InlineKeyboardButton(translate('view_analytics', message.from_user.id), callback_data='view_analytics'))
+    
+    bot.reply_to(message, translate('admin_panel', message.from_user.id), reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: call.data in ['set_price', 'set_referral_percent', 'export_users', 'create_guest_invite', 'set_usdt_price', 'create_promo', 'view_analytics'])
+@admin_required
+def admin_actions(call):
+    if call.data == 'set_price':
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.from_user.id, translate('enter_new_price', call.from_user.id))
+        bot.register_next_step_handler(msg, set_new_price)
+    elif call.data == 'set_referral_percent':
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.from_user.id, translate('enter_referral_percent', call.from_user.id))
+        bot.register_next_step_handler(msg, set_new_referral_percent)
+    elif call.data == 'export_users':
+        export_users_csv(call.from_user.id)
+    elif call.data == 'create_guest_invite':
+        create_guest_invite(call.from_user.id)
+    elif call.data == 'set_usdt_price':
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.from_user.id, translate('enter_usdt_price', call.from_user.id))
+        bot.register_next_step_handler(msg, set_new_usdt_price)
+    elif call.data == 'create_promo':
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.from_user.id, translate('enter_promo_details', call.from_user.id))
+        bot.register_next_step_handler(msg, create_promo_code)
+    elif call.data == 'view_analytics':
+        send_analytics(call.from_user.id)
+
+def set_new_price(message):
+    try:
+        new_price = float(message.text)
+        cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (str(new_price), 'subscription_price'))
+        conn.commit()
+        bot.reply_to(message, translate('price_updated', message.from_user.id).format(new_price))
+    except ValueError:
+        bot.reply_to(message, translate('invalid_price', message.from_user.id))
+
+def set_new_referral_percent(message):
+    try:
+        level1, level2 = map(float, message.text.split())
+        cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (str(level1), 'referral_percent_level1'))
+        cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (str(level2), 'referral_percent_level2'))
+        conn.commit()
+        bot.reply_to(message, translate('referral_percent_updated', message.from_user.id).format(level1, level2))
+    except ValueError:
+        bot.reply_to(message, translate('invalid_referral_percent', message.from_user.id))
+
+def export_users_csv(admin_id):
+    cursor.execute('SELECT * FROM users')
+    users = cursor.fetchall()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['user_id', 'username', 'referrer_id', 'subscription_end', 'language', 'level'])
+    writer.writerows(users)
+    
+    output.seek(0)
+    bot.send_document(admin_id, ('users.csv', output.getvalue().encode('utf-8')), caption=translate('users_exported', admin_id))
+
+def create_guest_invite(admin_id):
+    invite_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    expires_at = datetime.now() + timedelta(days=1)
+    cursor.execute('INSERT INTO guest_invites (invite_code, created_by, expires_at) VALUES (?, ?, ?)',
+                   (invite_code, admin_id, expires_at))
+    conn.commit()
+    bot.send_message(admin_id, translate('guest_invite_created', admin_id).format(invite_code, expires_at))
+
+def set_new_usdt_price(message):
+    try:
+        new_price = float(message.text)
+        cursor.execute('UPDATE settings SET value = ? WHERE key = ?', (str(new_price), 'usdt_price'))
+        conn.commit()
+        bot.reply_to(message, translate('usdt_price_updated', message.from_user.id).format(new_price))
+    except ValueError:
+        bot.reply_to(message, translate('invalid_price', message.from_user.id))
+
+def create_promo_code(message):
+    try:
+        code, discount, duration = message.text.split()
+        discount = float(discount)
+        duration = int(duration)
+        expires_at = datetime.now() + timedelta(days=duration)
+        cursor.execute('INSERT INTO promo_codes (code, discount, expires_at) VALUES (?, ?, ?)',
+                       (code, discount, expires_at))
+        conn.commit()
+        bot.reply_to(message, translate('promo_created', message.from_user.id).format(code, discount, expires_at))
+    except ValueError:
+        bot.reply_to(message, translate('invalid_promo_format', message.from_user.id))
+
+def send_analytics(admin_id):
+    total_users = cursor.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    active_subscriptions = cursor.execute('SELECT COUNT(*) FROM users WHERE subscription_end > ?', (datetime.now(),)).fetchone()[0]
+    total_revenue = cursor.execute('SELECT SUM(amount) FROM rewards').fetchone()[0] or 0
+    
+    report = f"Total Users: {total_users}\n"
+    report += f"Active Subscriptions: {active_subscriptions}\n"
+    report += f"Total Revenue: {total_revenue} Stars\n"
+    
+    bot.send_message(admin_id, report)
+    
+    # You can add more detailed analytics here, such as graphs or charts
+    # analytics.generate_report(admin_id)
+
+@bot.message_handler(commands=['language'])
+def set_language(message):
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    for lang_code, lang_name in [('en', 'English'), ('uk', 'Українська'), ('hi', 'हिन्दी'), ('ms', 'Bahasa Melayu'), 
+                                 ('es', 'Español'), ('pt', 'Português'), ('tr', 'Türkçe')]:
+        keyboard.add(telebot.types.InlineKeyboardButton(lang_name, callback_data=f'lang_{lang_code}'))
+    bot.reply_to(message, translate('choose_language', message.from_user.id), reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('lang_'))
+def change_language(call):
+    lang_code = call.data.split('_')[1]
+    user_id = call.from_user.id
+    cursor.execute('UPDATE users SET language = ? WHERE user_id = ?', (lang_code, user_id))
+    conn.commit()
+    bot.answer_callback_query(call.id, translate('language_changed', user_id))
+    bot.edit_message_text(translate('language_set', user_id), call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(commands=['support'])
+def support(message):
+    user_id = message.from_user.id
+    cursor.execute('SELECT value FROM settings WHERE key = ?', ('support_chat_id',))
+    support_chat_id = cursor.fetchone()[0]
+    bot.reply_to(message, translate('support_info', user_id))
+    bot.forward_message(support_chat_id, message.chat.id, message.message_id)
+
+def check_subscriptions():
+    current_time = datetime.now()
+    cursor.execute('SELECT user_id, subscription_end FROM users WHERE subscription_end IS NOT NULL AND subscription_end <= ?', (current_time,))
+    expired_users = cursor.fetchall()
+    
+    for user_id, subscription_end in expired_users:
+        try:
+            bot.kick_chat_member(CHANNEL_ID, user_id)
+            bot.unban_chat_member(CHANNEL_ID, user_id)  # Unban so the user can join again after payment
+            bot.send_message(user_id, translate('subscription_expired', user_id))
+            send_renewal_option(user_id)
+        except Exception as e:
+            print(f"Error processing expired subscription for user {user_id}: {e}")
+
+def send_renewal_option(user_id):
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.add(telebot.types.InlineKeyboardButton(translate('renew_subscription', user_id), callback_data='renew_subscription'))
+    bot.send_message(user_id, translate('renew_invitation', user_id), reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'renew_subscription')
+def renew_subscription(call):
+    subscribe(call.message)
+
+def run_schedule():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Run subscription check every hour
+schedule.every().hour.do(check_subscriptions)
+
+# Run the scheduler in a separate thread
+scheduler_thread = threading.Thread(target=run_schedule)
+scheduler_thread.start()
+
+if __name__ == '__main__':
+    bot.polling(none_stop=True)
